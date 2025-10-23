@@ -80,6 +80,38 @@ class WoETimeAnalysisWithIV:
         # Create IV summary dataframe
         self._create_iv_summary()
     
+    def _get_good_bad_flags(self):
+        """
+        Determine which target value (0 or 1) represents 'good' and 'bad'
+        based on the scorecardpy binning results
+        
+        Returns:
+        --------
+        tuple: (good_flag, bad_flag)
+        """
+        # Get any variable's bin info to check the totals
+        sample_var = list(self.bins_dict.keys())[0]
+        bins_info = self.bins_dict[sample_var]
+        
+        # Get the total good and bad from scorecardpy
+        total_bad_scorecard = bins_info['bad'].sum()
+        total_good_scorecard = bins_info['good'].sum()
+        
+        # Get the target value counts from our data
+        target_1_count = self.df[self.target_col].sum()
+        target_0_count = len(self.df) - target_1_count
+        
+        # Determine which target value corresponds to 'bad'
+        # The one that's closer to scorecardpy's bad count
+        if abs(target_1_count - total_bad_scorecard) < abs(target_0_count - total_bad_scorecard):
+            bad_flag = 1  # target=1 is bad
+            good_flag = 0  # target=0 is good
+        else:
+            bad_flag = 0  # target=0 is bad
+            good_flag = 1  # target=1 is good
+        
+        return good_flag, bad_flag
+    
     def _calculate_iv(self, bin_df):
         """
         Calculate Information Value for a variable
@@ -260,16 +292,33 @@ class WoETimeAnalysisWithIV:
             print(f"Variable {variable} not found")
             return
         
-        # Create a copy of the data with temporal grouping
+        # Get the binned column name
+        binned_col = self.get_binned_column_name(variable)
+        if binned_col is None:
+            print(f"Could not find binned column for {variable}")
+            return
+        
+        # Create a copy of the data with the original bins applied
         df_temp = self.df.copy()
         df_temp[self.date_col] = pd.to_datetime(df_temp[self.date_col])
+        df_temp['binned_value'] = self.df_binned[binned_col]
+        
+        # Get the bin information from the overall dataset
+        bins_info = self.bins_dict[variable].copy()
+        
+        # Create mapping from WoE values to bins
+        woe_to_bin = dict(zip(bins_info['woe'], bins_info['bin']))
+        df_temp['bin'] = df_temp['binned_value'].map(woe_to_bin)
         
         # Group by time window
         df_temp['period'] = df_temp[self.date_col].dt.to_period(window)
-        
-        # Calculate IV for each period
-        iv_over_time = []
         periods = df_temp['period'].unique()
+        
+        # Determine the correct good/bad labeling from the original bins
+        good_flag, bad_flag = self._get_good_bad_flags()
+        
+        # Calculate IV for each period using the consistent bins
+        iv_over_time = []
         
         for period in sorted(periods):
             period_data = df_temp[df_temp['period'] == period]
@@ -277,24 +326,42 @@ class WoETimeAnalysisWithIV:
             if len(period_data) < 30:  # Skip if too few samples
                 continue
             
-            # Calculate WoE bins for this period
-            try:
-                bins_period = sc.woebin(
-                    period_data[[variable, self.target_col]], 
-                    y=self.target_col,
-                    max_num_bin=5,
-                    print_info=False
-                )
-                
-                if variable in bins_period:
-                    iv_value = self._calculate_iv(bins_period[variable])
-                    iv_over_time.append({
-                        'Period': period.to_timestamp(),
-                        'IV': iv_value,
-                        'Sample Size': len(period_data)
-                    })
-            except:
+            # Calculate good/bad counts for this period
+            total_bad_period = (period_data[self.target_col] == bad_flag).sum()
+            total_good_period = (period_data[self.target_col] == good_flag).sum()
+            
+            if total_good_period == 0 or total_bad_period == 0:
                 continue
+            
+            # Calculate IV for this period using the fixed bins
+            period_iv = 0
+            
+            for _, bin_row in bins_info.iterrows():
+                bin_label = bin_row['bin']
+                bin_woe = bin_row['woe']
+                
+                # Get data for this bin in this period
+                bin_mask = period_data['bin'] == bin_label
+                bin_data = period_data[bin_mask]
+                
+                if len(bin_data) > 0:
+                    bad_count = (bin_data[self.target_col] == bad_flag).sum()
+                    good_count = (bin_data[self.target_col] == good_flag).sum()
+                    
+                    # Calculate distributions
+                    bad_dist = bad_count / total_bad_period if total_bad_period > 0 else 0
+                    good_dist = good_count / total_good_period if total_good_period > 0 else 0
+                    
+                    # Calculate IV contribution for this bin
+                    # IV = (good% - bad%) * WoE
+                    iv_contrib = (good_dist - bad_dist) * bin_woe
+                    period_iv += iv_contrib
+            
+            iv_over_time.append({
+                'Period': period.to_timestamp(),
+                'IV': period_iv,
+                'Sample Size': len(period_data)
+            })
         
         if not iv_over_time:
             print(f"Could not calculate temporal IV for {variable}")
@@ -314,10 +381,14 @@ class WoETimeAnalysisWithIV:
         ax1.axhline(y=0.3, color='yellow', linestyle='--', alpha=0.5, label='Medium')
         ax1.axhline(y=0.5, color='green', linestyle='--', alpha=0.5, label='Strong')
         
-        # Add mean line
+        # Add mean line and overall IV line
         mean_iv = iv_df['IV'].mean()
+        overall_iv = self.iv_dict.get(variable, 0)
+        
         ax1.axhline(y=mean_iv, color='black', linestyle='-', alpha=0.7, 
                    label=f'Mean IV: {mean_iv:.4f}')
+        ax1.axhline(y=overall_iv, color='blue', linestyle=':', linewidth=2, alpha=0.7, 
+                   label=f'Overall IV: {overall_iv:.4f}')
         
         ax1.set_xlabel('Period', fontsize=12)
         ax1.set_ylabel('Information Value (IV)', fontsize=12)
@@ -346,11 +417,269 @@ class WoETimeAnalysisWithIV:
         iv_cv = (iv_std / mean_iv) * 100 if mean_iv != 0 else 0
         
         print(f"\nIV Stability Metrics for {variable}:")
-        print(f"  Mean IV: {mean_iv:.4f}")
+        print(f"  Overall IV (full dataset): {overall_iv:.4f}")
+        print(f"  Mean IV (across periods): {mean_iv:.4f}")
         print(f"  Std Dev: {iv_std:.4f}")
         print(f"  Coefficient of Variation: {iv_cv:.2f}%")
         print(f"  Min IV: {iv_df['IV'].min():.4f}")
         print(f"  Max IV: {iv_df['IV'].max():.4f}")
+        
+        # Alert if temporal IV deviates significantly from overall IV
+        deviation = abs(mean_iv - overall_iv) / overall_iv * 100 if overall_iv != 0 else 0
+        if deviation > 20:
+            print(f"  ⚠️  Warning: Mean temporal IV deviates {deviation:.1f}% from overall IV")
+            print(f"     This may indicate unstable predictive power over time")
+    
+    def calculate_psi(self, variable, reference_period=None, comparison_period=None):
+        """
+        Calculate Population Stability Index (PSI) for a variable
+        
+        Parameters:
+        -----------
+        variable : str
+            Variable name to analyze
+        reference_period : tuple, optional
+            (start_date, end_date) for reference period
+        comparison_period : tuple, optional
+            (start_date, end_date) for comparison period
+        
+        Returns:
+        --------
+        float
+            PSI value
+        """
+        if variable not in self.bins_dict:
+            print(f"Variable {variable} not found")
+            return None
+        
+        # Get the binned column name
+        binned_col = self.get_binned_column_name(variable)
+        if binned_col is None:
+            return None
+        
+        # Prepare data with bins
+        df_temp = self.df.copy()
+        df_temp[self.date_col] = pd.to_datetime(df_temp[self.date_col])
+        df_temp['binned_value'] = self.df_binned[binned_col]
+        
+        # Get bin mapping
+        bins_info = self.bins_dict[variable]
+        woe_to_bin = dict(zip(bins_info['woe'], bins_info['bin']))
+        df_temp['bin'] = df_temp['binned_value'].map(woe_to_bin)
+        
+        # Define periods if not provided
+        if reference_period is None and comparison_period is None:
+            # Split data into two halves
+            sorted_dates = df_temp[self.date_col].sort_values()
+            mid_date = sorted_dates.quantile(0.5)
+            reference_data = df_temp[df_temp[self.date_col] <= mid_date]
+            comparison_data = df_temp[df_temp[self.date_col] > mid_date]
+        else:
+            if reference_period:
+                reference_data = df_temp[
+                    (df_temp[self.date_col] >= reference_period[0]) &
+                    (df_temp[self.date_col] <= reference_period[1])
+                ]
+            if comparison_period:
+                comparison_data = df_temp[
+                    (df_temp[self.date_col] >= comparison_period[0]) &
+                    (df_temp[self.date_col] <= comparison_period[1])
+                ]
+        
+        # Calculate distributions
+        ref_dist = reference_data['bin'].value_counts(normalize=True)
+        comp_dist = comparison_data['bin'].value_counts(normalize=True)
+        
+        # Calculate PSI
+        psi = 0
+        for bin_label in bins_info['bin']:
+            ref_pct = ref_dist.get(bin_label, 0.001)  # Avoid division by zero
+            comp_pct = comp_dist.get(bin_label, 0.001)
+            
+            psi += (comp_pct - ref_pct) * np.log(comp_pct / ref_pct)
+        
+        return psi
+    
+    def plot_iv_and_psi_monitoring(self, variable, window='M'):
+        """
+        Plot both IV and PSI over time for comprehensive stability monitoring
+        
+        Parameters:
+        -----------
+        variable : str
+            Variable name to analyze
+        window : str
+            Time window for aggregation
+        """
+        if variable not in self.bins_dict:
+            print(f"Variable {variable} not found")
+            return
+        
+        # Get the binned column name
+        binned_col = self.get_binned_column_name(variable)
+        if binned_col is None:
+            print(f"Could not find binned column for {variable}")
+            return
+        
+        # Prepare data
+        df_temp = self.df.copy()
+        df_temp[self.date_col] = pd.to_datetime(df_temp[self.date_col])
+        df_temp['binned_value'] = self.df_binned[binned_col]
+        
+        # Get bin information
+        bins_info = self.bins_dict[variable].copy()
+        woe_to_bin = dict(zip(bins_info['woe'], bins_info['bin']))
+        df_temp['bin'] = df_temp['binned_value'].map(woe_to_bin)
+        df_temp['period'] = df_temp[self.date_col].dt.to_period(window)
+        
+        # Get first period as reference for PSI
+        periods = sorted(df_temp['period'].unique())
+        reference_period_data = df_temp[df_temp['period'] == periods[0]]
+        ref_dist = reference_period_data['bin'].value_counts(normalize=True)
+        
+        # Calculate metrics for each period
+        monitoring_data = []
+        
+        for period in periods:
+            period_data = df_temp[df_temp['period'] == period]
+            
+            if len(period_data) < 30:
+                continue
+            
+            # Calculate IV for this period (using consistent bins)
+            # Determine the correct good/bad labeling from the original bins
+            good_flag, bad_flag = self._get_good_bad_flags()
+            
+            total_good = (period_data[self.target_col] == good_flag).sum()
+            total_bad = (period_data[self.target_col] == bad_flag).sum()
+            
+            if total_good > 0 and total_bad > 0:
+                iv_contribs = []
+                for _, bin_row in bins_info.iterrows():
+                    bin_label = bin_row['bin']
+                    bin_woe = bin_row['woe']
+                    
+                    bin_data = period_data[period_data['bin'] == bin_label]
+                    if len(bin_data) > 0:
+                        good_count = (bin_data[self.target_col] == good_flag).sum()
+                        bad_count = (bin_data[self.target_col] == bad_flag).sum()
+                        
+                        good_dist = good_count / total_good
+                        bad_dist = bad_count / total_bad
+                        
+                        iv_contribs.append((good_dist - bad_dist) * bin_woe)
+                
+                period_iv = sum(iv_contribs)
+            else:
+                period_iv = 0
+            
+            # Calculate PSI for this period vs reference
+            comp_dist = period_data['bin'].value_counts(normalize=True)
+            psi = 0
+            for bin_label in bins_info['bin']:
+                ref_pct = ref_dist.get(bin_label, 0.001)
+                comp_pct = comp_dist.get(bin_label, 0.001)
+                psi += (comp_pct - ref_pct) * np.log(comp_pct / ref_pct)
+            
+            monitoring_data.append({
+                'Period': period.to_timestamp(),
+                'IV': period_iv,
+                'PSI': psi,
+                'Sample Size': len(period_data)
+            })
+        
+        if not monitoring_data:
+            print("Insufficient data for monitoring")
+            return
+        
+        # Create monitoring plot
+        monitor_df = pd.DataFrame(monitoring_data)
+        
+        fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+        
+        # Plot 1: IV over time
+        ax1 = axes[0]
+        ax1.plot(monitor_df['Period'], monitor_df['IV'], 'bo-', linewidth=2, markersize=8, label='Temporal IV')
+        
+        overall_iv = self.iv_dict.get(variable, 0)
+        ax1.axhline(y=overall_iv, color='red', linestyle='--', linewidth=2, alpha=0.7, 
+                   label=f'Overall IV: {overall_iv:.4f}')
+        
+        # Add zones
+        ax1.axhline(y=0.1, color='orange', linestyle=':', alpha=0.3)
+        ax1.axhline(y=0.3, color='green', linestyle=':', alpha=0.3)
+        
+        ax1.set_ylabel('Information Value (IV)', fontsize=12)
+        ax1.set_title(f'Stability Monitoring for {variable}', fontsize=14, fontweight='bold')
+        ax1.legend(loc='best')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: PSI over time
+        ax2 = axes[1]
+        colors = ['green' if psi < 0.1 else 'orange' if psi < 0.25 else 'red' 
+                 for psi in monitor_df['PSI']]
+        bars = ax2.bar(monitor_df['Period'], monitor_df['PSI'], color=colors, alpha=0.7)
+        
+        # Add PSI thresholds
+        ax2.axhline(y=0.1, color='green', linestyle='--', alpha=0.5, label='Stable (<0.1)')
+        ax2.axhline(y=0.25, color='orange', linestyle='--', alpha=0.5, label='Moderate (0.1-0.25)')
+        
+        ax2.set_ylabel('Population Stability Index (PSI)', fontsize=12)
+        ax2.set_title('Distribution Stability (PSI vs First Period)', fontsize=12)
+        ax2.legend(loc='best')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add PSI values on bars
+        for bar, psi_val in zip(bars, monitor_df['PSI']):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                    f'{psi_val:.3f}', ha='center', va='bottom', fontsize=8)
+        
+        # Plot 3: Sample size
+        ax3 = axes[2]
+        ax3.bar(monitor_df['Period'], monitor_df['Sample Size'], alpha=0.6, color='skyblue')
+        ax3.set_xlabel('Period', fontsize=12)
+        ax3.set_ylabel('Sample Size', fontsize=12)
+        ax3.set_title('Sample Size Over Time', fontsize=12)
+        ax3.grid(True, alpha=0.3)
+        
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+        
+        # Print summary statistics
+        print(f"\nStability Monitoring Summary for {variable}:")
+        print("="*60)
+        print(f"Overall IV (full dataset): {overall_iv:.4f}")
+        print(f"\nTemporal IV Statistics:")
+        print(f"  Mean: {monitor_df['IV'].mean():.4f}")
+        print(f"  Std Dev: {monitor_df['IV'].std():.4f}")
+        print(f"  Min: {monitor_df['IV'].min():.4f}")
+        print(f"  Max: {monitor_df['IV'].max():.4f}")
+        
+        print(f"\nPSI Statistics (vs first period):")
+        print(f"  Mean: {monitor_df['PSI'].mean():.4f}")
+        print(f"  Max: {monitor_df['PSI'].max():.4f}")
+        
+        # Interpretation
+        max_psi = monitor_df['PSI'].max()
+        if max_psi < 0.1:
+            psi_status = "✅ Stable distribution"
+        elif max_psi < 0.25:
+            psi_status = "⚠️  Moderate shift in distribution"
+        else:
+            psi_status = "❌ Significant shift in distribution"
+        
+        print(f"\nInterpretation: {psi_status}")
+        
+        iv_cv = monitor_df['IV'].std() / monitor_df['IV'].mean() * 100
+        if iv_cv < 10:
+            iv_status = "✅ Stable predictive power"
+        elif iv_cv < 20:
+            iv_status = "⚠️  Moderate variability in predictive power"
+        else:
+            iv_status = "❌ High variability in predictive power"
+        
+        print(f"                {iv_status} (CV: {iv_cv:.1f}%)")
     
     def get_binned_column_name(self, variable):
         """
